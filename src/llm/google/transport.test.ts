@@ -159,6 +159,19 @@ describe('Google SSE gateway', () => {
     );
   });
 
+  it('consumes a complete CR-delimited event at EOF', async () => {
+    await withGateway(
+      (_req, res) => {
+        openStream(res);
+        res.end(`data: ${event('complete')}\r\r`);
+      },
+      async (client) => {
+        const chunks = await Array.fromAsync(await client.stream('Hello'));
+        expect(chunks.map((chunk) => chunk.text).join('')).toBe('complete');
+      }
+    );
+  });
+
   it.each([
     ['chunk streaming', 'streamGenerateContent'],
     ['typed events', 'streamGenerateContent'],
@@ -264,6 +277,7 @@ describe('Google SSE gateway', () => {
 
   it.each([
     ['data: {private gateway payload}\n\n', 'Invalid JSON in Gemini stream'],
+    ['data: {"candidates":', 'Incomplete Gemini stream event'],
     [
       'event: error\ndata: private gateway payload\n\n',
       'Gemini gateway returned a stream error',
@@ -289,4 +303,20 @@ describe('Google SSE gateway', () => {
       );
     }
   );
+
+  it('rejects invalid UTF-8 instead of changing generated text', async () => {
+    await withGateway(
+      (_req, res) => {
+        openStream(res);
+        const frame = Buffer.from(`data: ${event('utf8-marker')}\n\n`);
+        frame[frame.indexOf('utf8-marker')] = 0xff;
+        res.end(frame);
+      },
+      async (client) => {
+        const consume = async () =>
+          Array.fromAsync(await client.stream('Hello'));
+        await expect(consume()).rejects.toThrow(/utf-8/i);
+      }
+    );
+  });
 });

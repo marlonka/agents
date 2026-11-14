@@ -1,7 +1,4 @@
-import {
-  getLines,
-  getMessages,
-} from '@langchain/core/utils/event_source_parse';
+import { createParser } from 'eventsource-parser';
 import {
   GoogleGenerativeAIError,
   GoogleGenerativeAIFetchError,
@@ -15,7 +12,7 @@ import type {
   RequestOptions,
   ErrorDetails,
 } from '@google/generative-ai';
-import type { EventSourceMessage } from '@langchain/core/utils/event_source_parse';
+import type { EventSourceParser, EventSourceMessage } from 'eventsource-parser';
 
 type GoogleErrorResponse = {
   error?: { code?: number; message?: string; details?: ErrorDetails[] };
@@ -37,68 +34,82 @@ export type GoogleTransport = Omit<
 async function* readGoogleStream(
   body: ReadableStream<Uint8Array>
 ): AsyncGenerator<GenerateContentResponse> {
-  let parse: ReturnType<typeof getLines>;
-  const events = new TransformStream<Uint8Array, EventSourceMessage>({
-    start(controller): void {
-      parse = getLines(getMessages((event) => controller.enqueue(event)));
-    },
-    transform(chunk): void {
-      parse(chunk);
-    },
-  });
-  const reader = body.pipeThrough(events).getReader();
+  let parser: EventSourceParser;
+  let endsWithCR = false;
+  let atEnd = false;
+  const events = body
+    .pipeThrough(new TextDecoderStream('utf-8', { fatal: true }))
+    .pipeThrough(
+      new TransformStream<string, EventSourceMessage>({
+        start(controller): void {
+          parser = createParser({
+            onEvent(event): void {
+              if (atEnd) {
+                throw new GoogleGenerativeAIError(
+                  'Incomplete Gemini stream event'
+                );
+              }
+              controller.enqueue(event);
+            },
+          });
+        },
+        transform(chunk): void {
+          endsWithCR = chunk.endsWith('\r');
+          parser.feed(chunk);
+        },
+        flush(): void {
+          // Resolve a trailing CR, which the parser holds until it can check for LF.
+          if (endsWithCR) {
+            parser.feed('\n');
+          }
+          // Reject any data without a terminating blank line.
+          atEnd = true;
+          parser.feed('\n\n');
+        },
+      })
+    );
   let receivedData = false;
 
-  try {
-    for (
-      let read = await reader.read();
-      !read.done;
-      read = await reader.read()
-    ) {
-      const { value } = read;
-      if (value.event === 'error') {
-        throw new GoogleGenerativeAIError(
-          'Gemini gateway returned a stream error'
-        );
-      }
-      const data = value.data.trim();
-      if (data === '[DONE]') {
-        break;
-      }
-      if (data === '') {
-        continue;
-      }
+  for await (const event of events) {
+    if (event.event === 'error') {
+      throw new GoogleGenerativeAIError(
+        'Gemini gateway returned a stream error'
+      );
+    }
+    const data = event.data.trim();
+    if (data === '[DONE]') {
+      break;
+    }
+    if (data === '') {
+      continue;
+    }
 
-      let response: (GenerateContentResponse & GoogleErrorResponse) | null;
-      try {
-        response = JSON.parse(data);
-      } catch {
-        throw new GoogleGenerativeAIError('Invalid JSON in Gemini stream');
-      }
-      if (
-        response == null ||
-        typeof response !== 'object' ||
-        Array.isArray(response)
-      ) {
-        throw new GoogleGenerativeAIError('Invalid response in Gemini stream');
-      }
-      if (response.error != null) {
-        throw new GoogleGenerativeAIFetchError(
-          'Gemini gateway returned a stream error',
-          typeof response.error.code === 'number'
-            ? response.error.code
-            : undefined
-        );
-      }
-      receivedData = true;
-      yield response;
+    let response: (GenerateContentResponse & GoogleErrorResponse) | null;
+    try {
+      response = JSON.parse(data);
+    } catch {
+      throw new GoogleGenerativeAIError('Invalid JSON in Gemini stream');
     }
-    if (!receivedData) {
-      throw new GoogleGenerativeAIError('Gemini stream ended without data');
+    if (
+      response == null ||
+      typeof response !== 'object' ||
+      Array.isArray(response)
+    ) {
+      throw new GoogleGenerativeAIError('Invalid response in Gemini stream');
     }
-  } finally {
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
+    if (response.error != null) {
+      throw new GoogleGenerativeAIFetchError(
+        'Gemini gateway returned a stream error',
+        typeof response.error.code === 'number'
+          ? response.error.code
+          : undefined
+      );
+    }
+    receivedData = true;
+    yield response;
+  }
+  if (!receivedData) {
+    throw new GoogleGenerativeAIError('Gemini stream ended without data');
   }
 }
 
