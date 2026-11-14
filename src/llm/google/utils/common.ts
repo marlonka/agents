@@ -30,6 +30,7 @@ import {
   type InlineDataPart,
   type FunctionCallPart,
   type GenerateContentCandidate,
+  type GenerateContentResponse,
   type EnhancedGenerateContentResponse,
   type FunctionDeclaration as GenerativeAIFunctionDeclaration,
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
@@ -751,7 +752,8 @@ export function dropUnsupportedModelTurnPrefill(
 }
 
 export function convertResponseContentToChatGenerationChunk(
-  response: EnhancedGenerateContentResponse,
+  response: GenerateContentResponse &
+    Partial<Pick<EnhancedGenerateContentResponse, 'text' | 'functionCall' | 'functionCalls'>>,
   extra: {
     usageMetadata?: UsageMetadata | undefined;
     index: number;
